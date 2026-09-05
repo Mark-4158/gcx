@@ -1,0 +1,284 @@
+#!/usr/bin/python3
+'''
+    General Command for eXchange
+    Copyright (C) 2026  Mark A. Williams, Jr.
+
+    This program is free software: you can redistribute it and/or mAify
+    it under the terms of the GNU Affero General Public License as
+    published by the Free Software Foundation, either version 3 of the
+    License, or (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU Affero General Public License for more details.
+
+    You should have received a copy of the GNU Affero General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+'''
+import argparse, os, sys
+import datetime as dt
+from math import fma, ldexp, log2, pi, tan
+import warnings as wrn
+
+from configparser import ConfigParser
+from platformdirs import PlatformDirs
+
+import gi
+gi.require_version('Gtk', '4.0')
+from gi.repository import GLib, Gtk
+
+from matplotlib.backends.backend_gtk4 import NavigationToolbar2GTK4 as NavigationToolbar
+from matplotlib.backends.backend_gtk4agg import FigureCanvasGTK4Agg as FigureCanvas
+from matplotlib.collections import LineCollection
+from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.figure import Figure
+
+import numpy as np
+
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+
+
+def to_position(s):
+    X = {}
+    for sym in s.split(','):
+        s = sym.split(':')
+        X.update({s[0].strip().upper(): float(s[1]) if len(s) > 1 and s[1].isnumeric() else 1.})
+
+    return X
+
+def to_dt(s, ref=dt.datetime.now()):
+    s = s.split('/')
+    match len(s):
+        case 0:
+            return ref
+        case 1:
+            return ref - dt.timedelta(abs(float(s[0])))
+        case 2:
+            ref = ref.replace(month=int(s[0]), day=1)
+        case _:
+            t = int(s[2])
+            ref = ref.replace(ref.year - (ref.year - t) % 100 if t < 100 else t,
+                              int(s[0]), 1)
+
+    return dt.timedelta(float(s[1]) + -1.) + ref
+
+def dictcpy(dst, src):
+    dst.clear()
+    dst.update(src)
+
+    return dst
+
+def elemcpy(dst, i, src):
+    dst[i] = src
+
+    return dst[i]
+
+def pos_to_str(pos):
+    return ','.join([f'{sym}:{pos[sym]:.15g}' for sym in pos])
+
+def gcxPlot(fig, client, pos, dt0, dtN):
+    fig.clear()
+
+    ret = (pos_to_str(pos), dt0.strftime('%m/%d/%y'), dtN.strftime('%m/%d/%y'))
+    bars = StockBarsRequest(symbol_or_symbols=pos.keys(),
+                            timeframe=TimeFrame.Day, start=dt0, end=dtN)
+    bars = client.get_stock_bars(bars)
+    #print(bars.df.to_string())
+
+    Y = {}
+    for key in pos:
+        for bar in bars.data[key]:
+            T = bar.timestamp.timestamp() # seconds
+            Y[I] = fma(pos[key], bar.open , Y.setdefault(I := T + 162e2, 0.))
+            Y[I] = fma(pos[key], bar.close, Y.setdefault(I := T + 396e2, 0.))
+    bars = None
+
+    T = list(Y)
+    Y = list(Y.values())
+    key = Y[0] / Y[-1]
+    I = len(Y)
+    bar = np.fft.fftfreq(I, 1j)[1:]
+    I = range(0, I)
+
+    V = [log2(key**ldexp(tan(ldexp(((i << 1) - I[-1]) / I[-1], -2) * pi), -1) * Y[i]) for i in I]
+    V = np.fft.fft(V) # see the Langevin equation
+    key = I[-1] >> 1
+    V = [bar[key - i] * V[i] for i in I]
+    V = np.fft.ifft(V).real
+
+    ax = fig.add_subplot(1, 1, 1)
+    key = lambda t, pos: dt.datetime.fromtimestamp(t, tz=dt.timezone.utc).strftime('%m/%d/%y')
+
+    ax.xaxis.set_major_formatter(key)
+
+    bar = Y[-1]
+    key = lambda r, pos: f'{fma(bar, 1e2/r, -1e2):.2f}%'
+
+    ax.set_yscale('function', functions=(np.log2, np.exp2))
+    ax.yaxis.set_major_formatter(key)
+
+    ax.scatter(T[1::2], Y[1::2], c='skyblue', label='Close', marker='^')
+    ax.scatter(T[ ::2], Y[ ::2], c='skyblue', label='Open', linewidth=0)
+
+    pos = (T, Y)
+    key = np.stack(pos, axis=-1)
+    pos = (key[0,:][None,:], (key[:-1,:] + key[1:,:]) * .5, key[-1,:][None,:])
+    pos = np.concat(pos)
+    pos = (pos[:-1,:], key, pos[1:,:])
+    key = np.stack(pos, axis=-2)
+    pos = ['g', 'chocolate', 'r']
+    pos = LinearSegmentedColormap.from_list('gcx', pos)
+    key = LineCollection(key, cmap=pos, array=V, linestyle='dashed')
+    pos = ax.add_collection(key, autolim=False)
+    pos = fig.colorbar(pos, ax=ax, pad=1e-2)
+
+    I = min(V).item()
+
+    if I < 0.:
+        T = [I, ldexp(I * 3., -2), ldexp(I, -1), ldexp(I, -2)]
+        Y = ['Good', 'Fine']
+    else:
+        T.clear()
+        Y.clear()
+
+    T.append(0.)
+    I = max(V).item()
+
+    if I > 0.:
+        T.extend([ldexp(I, -2), ldexp(I, -1), ldexp(I * 3., -2), I])
+        Y.extend(['Bad', 'Ugly'])
+
+    pos.set_ticks(ticks=T[ ::2], labels=[])
+    pos.set_ticks(ticks=T[1::2], labels=Y, minor=True,
+                  verticalalignment='center', rotation='vertical')
+    pos.long_axis.set_tick_params(which='minor', tick1On=False, tick2On=False)
+
+    ax.grid(visible=True, which='both')
+    ax.legend(reverse=True)
+
+    fig.canvas.draw_idle()
+
+    return ret
+
+class gcxApplication(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id='com.github.gcx')
+        GLib.set_application_name('gcx')
+        GLib.set_prgname('gcx')
+
+    def do_activate(self):
+        dirs = PlatformDirs('gcx', 'GCX')
+        conf = ConfigParser()
+        conf.read(os.path.join(dirs.user_config_dir, 'settings.ini'))
+
+        to_pos = lambda s: to_position(s) if s[:1].isalpha() else {sym.upper(): float(conf['portfolio'][sym]) for sym in conf['portfolio']}
+
+        key_api = conf['api.historical.key']['api']
+        key_prv = conf['api.historical.key']['secret']
+        client = StockHistoricalDataClient(key_api, key_prv)
+
+        args = argparse.ArgumentParser(prog='gcx', usage='%(prog)s [options]')
+
+        args.add_argument('-d', '--date', type=ascii,
+                          help='end date (date or days prior today)')
+        args.add_argument('-l', '--lookback', type=ascii,
+                          help='lookback period (days or start date)')
+        args.add_argument('-s', '--symbol', type=ascii,
+                          help='ticker symbol')
+
+        args = args.parse_args()
+        pos = to_pos(args.symbol[1:-1] if args.symbol else '')
+
+        if args.date:
+            t = args.date[1:-1]
+        elif 'plot' in conf and 'date' in conf['plot']:
+            t = conf['plot']['date']
+        try:
+            t = to_dt(t)
+        except NameError:
+            t = dt.datetime.now()
+
+        if args.lookback:
+            T = args.lookback[1:-1]
+        elif 'plot' in conf and 'lookback' in conf['plot']:
+            T = conf['plot']['lookback']
+        try:
+            T = to_dt(T, t)
+        except NameError:
+            try:
+                T = [t.year - (t.month < 2), (t.month + 10) % 12 + 1]
+                T = t.replace(T[0], T[1])
+            except ValueError:
+                T = t.replace(T[0], T[1], t.day - 1)
+
+        T = [T, t]
+
+        win = Gtk.ApplicationWindow(application=self, title='GCX')
+        win.set_default_size(1000, 625)
+
+        # Create figure from historical data and positions
+        fig = Figure(figsize=(10, 6), constrained_layout=True)
+
+        # Create vbox
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        win.set_child(vbox)
+
+        # Create canvas from figure
+        canvas = FigureCanvas(fig)  # a Gtk.DrawingArea
+        canvas.set_hexpand(True)
+        canvas.set_vexpand(True)
+
+        # Create toolbar from canvas
+        toolbar = NavigationToolbar(canvas)
+
+        # Create hbox
+        hbox = Gtk.Box(spacing=6, halign=Gtk.Align.FILL)
+
+        # Create entry widgets
+        sym_wdg = Gtk.Entry(placeholder_text='Symbol(s)',
+                            text=pos_to_str(pos), hexpand=True)
+        dt0_wdg = Gtk.Entry(placeholder_text='Start Date',
+                            text=T[0].strftime('%m/%d/%y'))
+        dtN_wdg = Gtk.Entry(placeholder_text='End Date',
+                            text=T[1].strftime('%m/%d/%y'))
+
+        # Create their callbacks
+        cb_hlpr = lambda S: (sym_wdg.set_text(S[0]),
+                             dt0_wdg.set_text(S[1]), dtN_wdg.set_text(S[2]))
+        sym_cb = lambda buf: cb_hlpr(gcxPlot(fig, client,
+                                             dictcpy(pos, to_pos(buf.get_text())),
+                                             T[0], T[1]))
+        dt0_cb = lambda buf: cb_hlpr(gcxPlot(fig, client, pos,
+                                             elemcpy(T, 0, to_dt(buf.get_text(), T[1])),
+                                             T[1]))
+        dtN_cb = lambda buf: cb_hlpr(gcxPlot(fig, client, pos, T[0],
+                                             elemcpy(T, 1, to_dt(buf.get_text()))))
+
+        # Connect those callbacks
+        sym_wdg.connect('activate', sym_cb)
+        dt0_wdg.connect('activate', dt0_cb)
+        dtN_wdg.connect('activate', dtN_cb)
+
+        # Add widgets to hbox
+        hbox.append(sym_wdg)
+        hbox.append(dt0_wdg)
+        hbox.append(dtN_wdg)
+
+        # Add widgets to vbox
+        vbox.append(toolbar)
+        vbox.append(canvas)
+        vbox.append(hbox)
+
+        if args.date or args.lookback or args.symbol:
+            gcxPlot(fig, client, pos, T[0], T[1])
+        win.present()
+
+
+if __name__ == '__main__':
+    app = gcxApplication()
+
+    wrn.filterwarnings("ignore", category=RuntimeWarning)
+    sys.exit(app.run(None))
