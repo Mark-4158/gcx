@@ -1,0 +1,5 @@
+alpaca==1.0.0
+gi==0.8.1
+matplotlib==3.11.2
+numpy==2.5.4
+platformdirs==4.14.0

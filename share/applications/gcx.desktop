@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=GCX
+GenericName=General Command for eXchange
+Comment=Generate Financial Charts
+Categories=Finance;Economy;GTK;
+TryExec=gcx
+Exec=gcx %F
+Icon=gcx
