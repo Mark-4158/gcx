@@ -1,0 +1,386 @@
+#!/usr/bin/python3
+'''
+    General Command for eXchange
+    Copyright (C) 2026  Mark A. Williams, Jr.
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU Affero General Public License as
+    published by the Free Software Foundation, either version 3 of the
+    License, or (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU Affero General Public License for more details.
+
+    You should have received a copy of the GNU Affero General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+'''
+import os, sys
+import datetime as dt
+from math import fma
+import warnings as wrn
+
+from configparser import ConfigParser
+from platformdirs import PlatformDirs
+
+import numpy as np
+from numpy import ldexp, log2
+
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+
+import gi
+gi.require_version('Gtk', '4.0')
+from gi.repository import GLib, Gtk
+
+from matplotlib.backends.backend_gtk4 import NavigationToolbar2GTK4 as NavigationToolbar
+from matplotlib.backends.backend_gtk4agg import FigureCanvasGTK4Agg as FigureCanvas
+from matplotlib.collections import LineCollection
+from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.figure import Figure
+
+
+class gcxApplication(Gtk.Application):
+    def __init__(self, positions='', lookback_period='14', date_of_record='0'):
+        self.pos = positions
+        self.tm0 = lookback_period
+        self.tmN = date_of_record
+
+        super().__init__()
+        GLib.set_application_name('gcx')
+        GLib.set_prgname('gcx')
+
+def usage():
+    print('Usage: gcx [OPTION]...'
+          '\nChart portfolio.\n'
+          '\n  \033[1m-s, --symbols\033[0m    SYMBOL[:SHARES],...'
+          '\n  \033[1m-l, --lookback\033[0m     lookback period'
+          '\n  \033[1m-d, --date\033[0m         date of record'
+          '\n      \033[1m--help\033[0m'
+          '\n         display this help and exit')
+
+def eatopt(args = sys.argv[1:]):
+    pos = ''
+    tm0 = dt.datetime.now()
+    tm0 = f'{tm0.month - 6}/{tm0.day}'
+    tmN = '0'
+
+    i = 0
+    while i < len(args):
+        arg = args[i].replace('=', ' ').split(maxsplit=1)
+
+        opt = arg[0]
+        if opt[0] != '-':
+            print(f"gcx: spurious argument -- '{opt}'")
+            sys.exit(os.EX_USAGE)
+
+        args = arg[1:] + args[i+1:]
+
+        if len(opt) > 2 and opt[:2] != '--':
+            opt = opt[:2]
+            args = [f'-{arg[0][2:]}'] + args
+            i = 0
+        else:
+            i = not not len(args)
+
+        err_msg = f"gcx: missing argument to option -- '{opt}'"
+        match opt:
+            case '-s' | '--symbols':
+                if i:
+                    pos = args[0]
+                    continue
+            case '-l' | '--lookback':
+                if i:
+                    tm0 = args[0]
+                    continue
+            case '-d' | '--date':
+                if i:
+                    tmN = args[0]
+                    continue
+            case '--help':
+                usage()
+                sys.exit(os.EX_OK)
+            case _:
+                err_msg = f"gcx: invalid option -- '{opt}'"
+
+        print(err_msg + "\nTry 'gcx --help' for more information.")
+        sys.exit(os.EX_USAGE)
+
+    return pos, tm0, tmN
+
+def to_scalar(s):
+    try:
+        return float(s)
+    except:
+        return 0.
+
+def to_position(s):
+    pos = {}
+    for sym in s.split(','):
+        if len(sym):
+            s = sym.split(':')
+            pos.update({s[0].strip().upper(): to_scalar(s[1]) if len(s) > 1 else 1.})
+
+    return pos
+
+def to_dt(s, ref=None):
+    if ref or (ref := dt.datetime.now()).weekday() > 4:
+        ref = ref.replace(hour=0, minute=0, second=0) - dt.timedelta(ref.weekday() == 6)
+
+    s = s.split('/')
+    match len(s):
+        case 0:
+            return ref
+        case 1:
+            return ref - dt.timedelta(abs(float(s[0]))) if len(s[0]) else ref
+        case 2:
+            yr = ref.year
+        case _:
+            yr = int(s[2])
+
+    mo = int(s[0]) - 13
+    yr+= int(mo / 12)
+    mo = (mo % 12 + 12) % 12 + 1
+
+    ref = ref.replace(ref.year - (ref.year - yr) % 100 if yr < 100 else yr,
+                      mo, 1)
+    ref+= dt.timedelta(float(s[1]) + -1.)
+    ref+= dt.timedelta(min(4 - ref.weekday(), 0.))
+
+    return ref
+
+def dictcpy(dst, src):
+    dst.clear()
+    dst.update(src)
+
+    return dst
+
+def elemcpy(dst, i, src):
+    dst[i] = src
+
+    return dst[i]
+
+def pos_to_str(pos):
+    return ','.join([f'{sym}:{pos[sym]:.15g}' for sym in pos])
+
+def dt_to_str(t):
+    return f'{t.month}/{t.day}/{t.year % 100}'
+
+def gcxPlot(fig, client, pos, tm0, tmN):
+    fig.clear()
+
+    isSameDay = tmN.timestamp() - tm0.timestamp() < 864e2
+    bars = StockBarsRequest(symbol_or_symbols=pos.keys(),
+                            timeframe=TimeFrame.Minute if isSameDay else TimeFrame.Day,
+                            start=tm0, end=tmN)
+    bars = client.get_stock_bars(bars)
+    #print(bars.df.to_string())
+
+    Y = {}
+    for key in pos:
+        if key in bars.data:
+            for bar in bars.data[key]:
+                T = bar.timestamp.timestamp() # seconds
+                if isSameDay:
+                    for t in Y.keys():
+                        if T < t:
+                            T = t
+                            break
+                    Y[I] = fma(pos[key], bar.close, Y.setdefault(I:= T + 59., 0.))
+                else:
+                    Y[I] = fma(pos[key], bar.open,  Y.setdefault(I:= T + 162e2, 0.))
+                    Y[I] = fma(pos[key], bar.close, Y.setdefault(I:= T + 396e2, 0.))
+        else:
+            pos[key] = 0.
+    del bar, bars
+
+    ret = (pos_to_str(pos), dt_to_str(tm0), dt_to_str(tmN))
+
+    T = list(Y)
+    Y = [ np.longdouble(y) for y in Y.values() ]
+    key = Y[0] / Y[-1]
+    V = ldexp(log2(Y[0] * Y[-1]), -1)
+
+    N = len(Y)
+    I = range(0, N-1)
+    I = range(0, N)
+    #for i in I: Y[i] = key
+    N = np.longdouble(N << 1)
+    V = [V] + [log2(key**(((i << 1) - I[-1]) / N) * Y[i]) for i in I] + [V]
+    V = np.fft.fft(V) # see the Langevin equation
+    N = I[-1] >> 1
+    I = len(V)
+    key = np.fft.fftfreq(I, -1j)
+    I = range(0, I)
+    for i in I:
+        V[i]*= key[1:][N - i]# * key[i]
+    key = np.geomspace(max(Y), min(Y), int(fma(fig.get_figheight(), 1.27, .5)))
+    N = len(Y) - 1
+    I = range(0, N)
+    I = [ Y[i+1] / Y[i] for i in I ]
+    I = np.mean(I)**N * Y[0]
+    N = -Y[-1]
+    V = np.fft.ifft(V).real[1:-1]
+
+    ax = fig.add_subplot(1, 1, 1)
+    ax.set_yscale('function', functions=(np.log2, np.exp2))
+    ax.set_yticks(key)
+
+    key = lambda y, pos: f'{ldexp(fma(N / y, -25., -25.), 2):.2f}%'
+
+    ax.yaxis.set_major_formatter(key)
+
+    if isSameDay:
+        bar = lambda t: f'{t.hour:02d}:{t.minute:02d}'
+    else:
+        bar = dt_to_str
+    key = lambda t, pos: bar(dt.datetime.fromtimestamp(t, tz=dt.timezone.utc))
+
+    ax.xaxis.set_major_formatter(key)
+
+    ax.axhline(I, c='purple', label='Level', ls=':')
+    if isSameDay:
+        ax.scatter(T[-1], Y[-1], c='skyblue', label='Close', marker='^')
+        ax.scatter(T[:-1], Y[:-1], c='skyblue', label='Open', linewidth=0)
+    else:
+        ax.scatter(T[1::2], Y[1::2], c='skyblue', label='Close', marker='^')
+        ax.scatter(T[ ::2], Y[ ::2], c='skyblue', label='Open', linewidth=0)
+    del isSameDay
+
+    pos = (T, Y)
+    key = np.stack(pos, axis=-1)
+    pos = (key[0,:][None,:], (key[:-1,:] + key[1:,:]) * .5, key[-1,:][None,:])
+    pos = np.concat(pos)
+    pos = (pos[:-1,:], key, pos[1:,:])
+    key = np.stack(pos, axis=-2)
+    pos = ['r', 'chocolate', 'g']
+    pos = LinearSegmentedColormap.from_list('gcx', pos)
+    key = LineCollection(key, cmap=pos, array=V, linestyle='dashed')
+
+    ax.add_collection(key, autolim=False)
+    ax.grid(visible=True, which='both')
+    ax.legend(reverse=True)
+
+    fig.canvas.draw_idle()
+
+    return ret
+
+def gcxActivate(app):
+    dirs = PlatformDirs('gcx', 'GCX')
+    conf = ConfigParser()
+    conf.read(os.path.join(dirs.user_config_dir, 'settings.ini'))
+
+    to_pos = lambda s: to_position(s) if s[:1].isalpha() else {sym.upper(): float(conf['portfolio'][sym]) for sym in conf['portfolio']}
+
+    key_api = conf['api.historical.key']['api']
+    key_prv = conf['api.historical.key']['secret']
+    client = StockHistoricalDataClient(key_api, key_prv)
+
+    pos = to_pos(app.pos if app.pos else '')
+    T = dt.datetime.now()
+
+    if app.tmN:
+        t = app.tmN
+    elif 'plot' in conf and 'date' in conf['plot']:
+        t = conf['plot']['date']
+    try:
+        t = to_dt(t)
+        if t.date() < T.date():
+            t = t.replace(hour=23, minute=59, second=59, microsecond=999999)
+        else:
+            t = t.replace(hour=T.hour, minute=T.minute, second=T.second,
+                          microsecond=T.microsecond)
+    except NameError:
+        t = dt.datetime.now()
+
+    if app.tm0:
+        T = app.tm0
+    elif 'plot' in conf and 'lookback' in conf['plot']:
+        T = conf['plot']['lookback']
+    try:
+        T = to_dt(T, t).replace(hour=0, minute=0, second=0, microsecond=0)
+    except NameError:
+        T = dt.timedelta((t.weekday() >> 2) + 14)
+        T = t - T
+
+    T = [T.replace(hour=2, minute=0), t]
+
+    win = Gtk.ApplicationWindow(application=app, title='GCX')
+    win.set_default_size(1000, 625)
+
+    # Create figure from historical data and positions
+    fig = Figure(figsize=(10, 6), constrained_layout=True)
+    gcxPlot(fig, client, pos, T[0], T[1])
+
+    # Create vbox
+    vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    win.set_child(vbox)
+
+    # Create canvas from figure
+    canvas = FigureCanvas(fig)  # a Gtk.DrawingArea
+    canvas.set_hexpand(True)
+    canvas.set_vexpand(True)
+
+    # Create toolbar from canvas
+    toolbar = NavigationToolbar(canvas)
+
+    # Create hbox
+    hbox = Gtk.Box(spacing=6, halign=Gtk.Align.FILL)
+
+    # Create entry widgets
+    sym_wdg = Gtk.Entry(placeholder_text='Symbol(s)',
+                        text=pos_to_str(pos), hexpand=True)
+    tm0_wdg = Gtk.Entry(placeholder_text='Start Date', text=dt_to_str(T[0]))
+    tmN_wdg = Gtk.Entry(placeholder_text='End Date',   text=dt_to_str(T[1]))
+
+    # Create their callbacks
+    cb_hlpr = lambda S: (sym_wdg.set_text(S[0]),
+                         tm0_wdg.set_text(S[1]), tmN_wdg.set_text(S[2]))
+    sym_cb = lambda buf: cb_hlpr(gcxPlot(fig, client,
+                                         dictcpy(pos, to_pos(buf.get_text())),
+                                         T[0], T[1]))
+    tm0_cb = lambda buf: cb_hlpr(gcxPlot(fig, client, pos,
+                                         elemcpy(T, 0, to_dt(buf.get_text(),
+                                                             T[1].replace(hour=2, minute=0))),
+                                         T[1]))
+    tmN_cb = lambda buf: cb_hlpr(gcxPlot(fig, client, pos, T[0],
+                                         elemcpy(T, 1, to_dt(buf.get_text()))))
+
+    # Connect those callbacks
+    sym_wdg.connect('activate', sym_cb)
+    tm0_wdg.connect('activate', tm0_cb)
+    tmN_wdg.connect('activate', tmN_cb)
+
+    # Add widgets to hbox
+    hbox.append(sym_wdg)
+    hbox.append(tm0_wdg)
+    hbox.append(tmN_wdg)
+
+    # Add widgets to vbox
+    vbox.append(toolbar)
+    vbox.append(canvas)
+    vbox.append(hbox)
+
+    win.present()
+
+def gcxRun():
+    pos, tm0, tmN = eatopt()
+    app = gcxApplication(pos, tm0, tmN)
+
+    app.connect('activate', gcxActivate)
+
+    return app.run()
+
+if __name__ == '__main__':
+    wrn.filterwarnings("ignore", category=RuntimeWarning)
+
+    try:
+        ret = gcxRun()
+    except KeyboardInterrupt:
+        ret = os.EX_OK
+    except:
+        ret = os.EX_ERROR
+
+    sys.exit(ret)
